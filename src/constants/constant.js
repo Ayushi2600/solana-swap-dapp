@@ -1,0 +1,6 @@
+export const WSOL_MINT = "So11111111111111111111111111111111111111112";
+export const USDC_MINT_DEVNET = "94CyfM1LcY8riaZJotZXGjB7GfjVZKWSiQ13DXwmnN8Z";
+export const USDC_MINT_MAINNET_BETA =
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+export const SLIPPAGE_BPS = 50; // 0.5% slippage
+
