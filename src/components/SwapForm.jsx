@@ -24,7 +24,7 @@ const SwapForm = () => {
 
   const [isSwapping, setIsSwapping] = useState(false);
   const [balances, setBalances] = useState({ sol: 0, usdc: 0 });
-  const [lastTransactionType, setLastTransactionType] = useState(''); // 'real' or 'simulation'
+  const [lastTransaction, setLastTransaction] = useState(null);
 
   const tokens = {
     SOL: {
@@ -43,35 +43,39 @@ const SwapForm = () => {
     },
   };
 
-  // 🪙 Fetch balances
-  useEffect(() => {
-    if (!connected || !publicKey) return;
+  // 🪙 Refresh balances function
+  const refreshBalances = useCallback(async () => {
+    if (!publicKey) return;
 
-    const fetchBalances = async () => {
+    try {      
+      // Fetch SOL balance
+      const solBalance = (await connection.getBalance(publicKey)) / 1e9;
+
+      // Fetch USDC balance
+      const usdcMintPubkey = new PublicKey(USDC_MINT_DEVNET);
+      const usdcATA = await getAssociatedTokenAddress(usdcMintPubkey, publicKey);
+      let usdcBalance = 0;
+
       try {
-        // Fetch SOL balance
-        const solBalance = (await connection.getBalance(publicKey)) / 1e9;
-
-        // Fetch USDC balance
-        const usdcMintPubkey = new PublicKey(USDC_MINT_DEVNET);
-        const usdcATA = await getAssociatedTokenAddress(usdcMintPubkey, publicKey);
-        let usdcBalance = 0;
-
-        try {
-          const accountInfo = await getAccount(connection, usdcATA);
-          usdcBalance = Number(accountInfo.amount) / 1e6;
-        } catch {
-          usdcBalance = 0;
-        }
-
-        setBalances({ sol: solBalance, usdc: usdcBalance });
-      } catch (err) {
-        console.error("Balance fetch failed", err);
+        const accountInfo = await getAccount(connection, usdcATA);
+        usdcBalance = Number(accountInfo.amount) / 1e6;
+      } catch {
+        usdcBalance = 0;
       }
-    };
 
-    fetchBalances();
-  }, [connected, publicKey, connection]);
+      setBalances({ sol: solBalance, usdc: usdcBalance });
+      
+    } catch (err) {
+      console.error("Balance refresh failed", err);
+    }
+  }, [connection, publicKey]);
+
+  // 🪙 Fetch balances on component mount and connection change
+  useEffect(() => {
+    if (connected && publicKey) {
+      refreshBalances();
+    }
+  }, [connected, publicKey, refreshBalances]);
 
   // 🔍 Get swap quote
   const getQuote = useCallback(async () => {
@@ -89,8 +93,11 @@ const SwapForm = () => {
       setSwapData({ quote: null, loading: true, error: null });
 
       const workingSwap = new WorkingSwap(connection, publicKey, sendTransaction);
+      
+      // Convert the human-readable amount to smallest units
+      const inputAmount = parseFloat(formData.amount);
       const amountInSmallestUnit = Math.floor(
-        parseFloat(formData.amount) * Math.pow(10, tokens[formData.fromToken].decimals)
+        inputAmount * Math.pow(10, tokens[formData.fromToken].decimals)
       );
 
       const quote = await workingSwap.getQuote(
@@ -124,83 +131,86 @@ const SwapForm = () => {
     }
 
     setIsSwapping(true);
-    setLastTransactionType('');
     
     try {
       const workingSwap = new WorkingSwap(connection, publicKey, sendTransaction);
-      const signature = await workingSwap.executeSwap(
+      
+      const result = await workingSwap.executeSwap(
         swapData.quote,
         fromTokenData.mint,
         toTokenData.mint
       );
 
-      // Determine if it was a real transaction or simulation
-      const isRealTransaction = signature.length === 88; // Real Solana signatures are 88 chars
-      setLastTransactionType(isRealTransaction ? 'real' : 'simulation');
+      // Store transaction details for UI display
+      const transactionDetails = {
+        signature: result.signature,
+        isRealTransaction: result.isRealTransaction,
+        inputAmount: result.inputAmount / Math.pow(10, fromTokenData.decimals),
+        outputAmount: result.outputAmount / Math.pow(10, toTokenData.decimals),
+        fromToken: fromTokenData.symbol,
+        toToken: toTokenData.symbol,
+        timestamp: new Date().toLocaleTimeString(),
+        explorerUrl: `https://explorer.solana.com/tx/${result.signature}?cluster=devnet`
+      };
 
-      if (isRealTransaction) {
+      setLastTransaction(transactionDetails);
+
+      if (result.isRealTransaction) {
         toast.success(
           <div>
             <div>✅ REAL Swap Successful!</div>
-            <div className="text-xs">Signature: {signature.slice(0, 16)}...</div>
-            <div className="text-xs mt-1">
-              <a 
-                href={`https://explorer.solana.com/tx/${signature}?cluster=devnet`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-blue-300 underline"
-              >
-                View on Explorer
-              </a>
+            <div className="text-xs">
+              View transaction details below
             </div>
           </div>
         );
 
-        // Refresh balances after real transaction
+        // Update UI balances based on the swap
+        if (result.isSolToUsdc) {
+          // SOL to USDC swap
+          setBalances(prev => ({
+            sol: Math.max(0, prev.sol - transactionDetails.inputAmount),
+            usdc: prev.usdc + transactionDetails.outputAmount
+          }));
+        } else {
+          // USDC to SOL swap
+          setBalances(prev => ({
+            sol: prev.sol + transactionDetails.outputAmount,
+            usdc: Math.max(0, prev.usdc - transactionDetails.inputAmount)
+          }));
+        }
+
+        // Also refresh actual blockchain balances
         setTimeout(async () => {
           try {
-            const solBalance = (await connection.getBalance(publicKey)) / 1e9;
-            
-            const usdcMintPubkey = new PublicKey(USDC_MINT_DEVNET);
-            const usdcATA = await getAssociatedTokenAddress(usdcMintPubkey, publicKey);
-            let usdcBalance = 0;
-            
-            try {
-              const accountInfo = await getAccount(connection, usdcATA);
-              usdcBalance = Number(accountInfo.amount) / 1e6;
-            } catch {
-              usdcBalance = 0;
-            }
-            
-            setBalances({ sol: solBalance, usdc: usdcBalance });
+            await refreshBalances();
           } catch (err) {
             console.error("Failed to refresh balances:", err);
           }
         }, 2000);
+
       } else {
         toast.success(
           <div>
             <div>🔄 Swap Simulation Successful!</div>
-            <div className="text-xs">Mock Signature: {signature.slice(0, 16)}...</div>
-            <div className="text-xs mt-1 text-yellow-300">
-              This was a simulation. Balances updated in UI only.
+            <div className="text-xs">
+              View simulation details below
             </div>
           </div>
         );
 
         // Update UI balances for simulation
-        const inputAmount = parseFloat(formData.amount);
-        const outputAmount = swapData.quote.outputAmount / Math.pow(10, toTokenData.decimals);
-        
-        if (formData.fromToken === "SOL") {
+        if (result.isSolToUsdc) {
+          // SOL to USDC swap
           setBalances(prev => ({
-            sol: Math.max(0, prev.sol - inputAmount),
-            usdc: prev.usdc + outputAmount
+            sol: Math.max(0, prev.sol - transactionDetails.inputAmount),
+            usdc: prev.usdc + transactionDetails.outputAmount
           }));
         } else {
+          // USDC to SOL swap
           setBalances(prev => ({
-            sol: prev.sol + outputAmount,
-            usdc: Math.max(0, prev.usdc - inputAmount)
+            sol: prev.sol + transactionDetails.outputAmount,
+            usdc: Math.max(0, prev.usdc - transactionDetails.inputAmount)
           }));
         }
       }
@@ -231,6 +241,18 @@ const SwapForm = () => {
     setFormData({ ...formData, amount: maxAmount.toFixed(6) });
   };
 
+  // Manual refresh balances button
+  const handleRefreshBalances = async () => {
+    toast.loading("Refreshing balances...");
+    await refreshBalances();
+    toast.success("Balances updated!");
+  };
+
+  // Clear last transaction
+  const clearLastTransaction = () => {
+    setLastTransaction(null);
+  };
+
   if (!connected)
     return (
       <p className="text-center text-gray-300 mt-6">
@@ -253,35 +275,87 @@ const SwapForm = () => {
         Swap Tokens
       </h3>
 
-      {/* Transaction Mode Indicator */}
-      {lastTransactionType && (
-        <div className={`mb-4 p-3 rounded-lg border ${
-          lastTransactionType === 'real' 
+      {/* Balance Refresh Button */}
+      <div className="mb-4 flex justify-between items-center">
+        <button
+          onClick={handleRefreshBalances}
+          className="text-sm bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded transition-colors"
+        >
+          🔄 Refresh Balances
+        </button>
+        <div className="text-xs text-gray-400">
+          SOL: {balances.sol.toFixed(4)} | USDC: {balances.usdc.toFixed(4)}
+        </div>
+      </div>
+
+      {/* Last Transaction Details */}
+      {lastTransaction && (
+        <div className={`mb-4 p-4 rounded-lg border ${
+          lastTransaction.isRealTransaction 
             ? 'bg-green-900 border-green-700' 
             : 'bg-yellow-900 border-yellow-700'
         }`}>
-          <p className={`text-sm text-center ${
-            lastTransactionType === 'real' ? 'text-green-200' : 'text-yellow-200'
-          }`}>
-            <strong>
-              {lastTransactionType === 'real' ? '✅ REAL Transaction' : '🔄 SIMULATION Mode'}
-            </strong>
-          </p>
-          <p className="text-xs text-center mt-1 text-gray-300">
-            {lastTransactionType === 'real' 
-              ? 'Transaction was sent to blockchain' 
-              : 'UI simulation only - no blockchain transaction'
-            }
-          </p>
+          <div className="flex justify-between items-start mb-2">
+            <div>
+              <p className={`font-semibold ${
+                lastTransaction.isRealTransaction ? 'text-green-200' : 'text-yellow-200'
+              }`}>
+                {lastTransaction.isRealTransaction ? '✅ Transaction Successful' : '🔄 Simulation Complete'}
+              </p>
+              <p className="text-xs text-gray-300 mt-1">
+                {lastTransaction.timestamp}
+              </p>
+            </div>
+            <button 
+              onClick={clearLastTransaction}
+              className="text-gray-400 hover:text-white text-sm"
+            >
+              ✕
+            </button>
+          </div>
+          
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between">
+              <span className="text-gray-400">Swapped:</span>
+              <span className="text-white">
+                {lastTransaction.inputAmount} {lastTransaction.fromToken} → {lastTransaction.outputAmount} {lastTransaction.toToken}
+              </span>
+            </div>
+            
+            <div className="flex justify-between items-center">
+              <span className="text-gray-400">Signature:</span>
+              <div className="flex items-center space-x-2">
+                <code className="text-xs bg-black bg-opacity-50 px-2 py-1 rounded">
+                  {lastTransaction.signature.slice(0, 8)}...{lastTransaction.signature.slice(-8)}
+                </code>
+                {lastTransaction.isRealTransaction && (
+                  <a 
+                    href={lastTransaction.explorerUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-400 hover:text-blue-300 text-xs"
+                    title="View on Solana Explorer"
+                  >
+                    🔍
+                  </a>
+                )}
+              </div>
+            </div>
+
+            {lastTransaction.isRealTransaction ? (
+              <div className="flex justify-between">
+                <span className="text-gray-400">Status:</span>
+                <span className="text-green-400">Confirmed on Devnet</span>
+              </div>
+            ) : (
+              <div className="flex justify-between">
+                <span className="text-gray-400">Status:</span>
+                <span className="text-yellow-400">Simulation Only</span>
+              </div>
+            )}
+          </div>
         </div>
       )}
-
-      {/* Info Banner */}
-      <div className="mb-4 p-3 bg-blue-900 border border-blue-700 rounded-lg">
-        <p className="text-blue-200 text-sm text-center">
-          <strong>Smart Mode:</strong> Tries real transactions, falls back to simulation
-        </p>
-      </div>
 
       {/* FROM TOKEN */}
       <div className="bg-gray-800 rounded-lg p-4 mb-4">
@@ -376,27 +450,21 @@ const SwapForm = () => {
         )}
       </button>
 
-      {/* Transaction Info */}
+      {/* Current Quote Info */}
       {swapData.quote && (
         <div className="mt-4 p-3 bg-gray-800 rounded-lg">
           <div className="text-sm text-gray-400">
             <div className="flex justify-between">
-              <span>Input:</span>
+              <span>You pay:</span>
               <span>{inputAmount} {fromTokenData.symbol}</span>
             </div>
             <div className="flex justify-between">
-              <span>Output:</span>
+              <span>You receive:</span>
               <span>{outputAmount.toFixed(6)} {toTokenData.symbol}</span>
             </div>
             <div className="flex justify-between">
               <span>Exchange Rate:</span>
               <span>1 {fromTokenData.symbol} = {swapData.quote.exchangeRate} {toTokenData.symbol}</span>
-            </div>
-            <div className="mt-2 text-xs text-yellow-400">
-              {sendTransaction ? 
-                "Will attempt real transaction with Phantom" : 
-                "Simulation mode - no wallet connection"
-              }
             </div>
           </div>
         </div>
