@@ -1,0 +1,30 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Transaction {
+  id            Int       @id @default(autoincrement())
+  walletAddress String
+  signature     String
+  type          String    // "swap" ya "transfer"
+  tokenChanges  Json      // [{ amount: number, tokenSymbol: string }]
+  status        String    // "pending", "confirmed", etc.
+  timestamp     Int
+  explorerUrl   String?
+
+  // Optional fields
+  isRealTransaction Boolean?  // optional
+  inputMint         String?   // optional
+  outputMint        String?   // optional
+  fee               Float?    // optional
+  priceImpact       String?   // optional
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+

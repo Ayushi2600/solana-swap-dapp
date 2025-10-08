@@ -5,10 +5,12 @@ import { getAssociatedTokenAddress, getAccount } from "@solana/spl-token";
 import { PublicKey } from "@solana/web3.js";
 import { WSOL_MINT, USDC_MINT_DEVNET } from "../constants/constant";
 import { WorkingSwap } from "../utils/workingSwapUtils";
+import { RaydiumSwap } from "../utils/raydiumSwapUtils";
+import { createTransactionRecord } from "../services/transactionAPI";
 
-const SwapForm = () => {
+const SwapForm = ({ onTransactionComplete }) => {
   const { connection } = useConnection();
-  const { publicKey, sendTransaction, connected, wallet } = useWallet();
+  const { publicKey, sendTransaction, connected } = useWallet();
 
   const [formData, setFormData] = useState({
     fromToken: "SOL",
@@ -25,6 +27,7 @@ const SwapForm = () => {
   const [isSwapping, setIsSwapping] = useState(false);
   const [balances, setBalances] = useState({ sol: 0, usdc: 0 });
   const [lastTransaction, setLastTransaction] = useState(null);
+  const [useRaydium, setUseRaydium] = useState(false);
 
   const tokens = {
     SOL: {
@@ -43,15 +46,13 @@ const SwapForm = () => {
     },
   };
 
-  // 🪙 Refresh balances function
+  // Refresh balances function
   const refreshBalances = useCallback(async () => {
     if (!publicKey) return;
 
-    try {      
-      // Fetch SOL balance
+    try {
       const solBalance = (await connection.getBalance(publicKey)) / 1e9;
 
-      // Fetch USDC balance
       const usdcMintPubkey = new PublicKey(USDC_MINT_DEVNET);
       const usdcATA = await getAssociatedTokenAddress(usdcMintPubkey, publicKey);
       let usdcBalance = 0;
@@ -64,20 +65,29 @@ const SwapForm = () => {
       }
 
       setBalances({ sol: solBalance, usdc: usdcBalance });
-      
+
     } catch (err) {
       console.error("Balance refresh failed", err);
     }
   }, [connection, publicKey]);
 
-  // 🪙 Fetch balances on component mount and connection change
+  useEffect(() => {
+    if (lastTransaction?.isRealTransaction) {
+      // Refresh balances after a real transaction
+      const timer = setTimeout(() => {
+        refreshBalances();
+      }, 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [lastTransaction]);
+
   useEffect(() => {
     if (connected && publicKey) {
       refreshBalances();
     }
   }, [connected, publicKey, refreshBalances]);
 
-  // 🔍 Get swap quote
+  // Get swap quote
   const getQuote = useCallback(async () => {
     if (!formData.amount || parseFloat(formData.amount) <= 0) {
       setSwapData({ quote: null, loading: false, error: "Please enter a valid amount" });
@@ -92,38 +102,67 @@ const SwapForm = () => {
     try {
       setSwapData({ quote: null, loading: true, error: null });
 
-      const workingSwap = new WorkingSwap(connection, publicKey, sendTransaction);
-      
-      // Convert the human-readable amount to smallest units
       const inputAmount = parseFloat(formData.amount);
       const amountInSmallestUnit = Math.floor(
         inputAmount * Math.pow(10, tokens[formData.fromToken].decimals)
       );
 
-      const quote = await workingSwap.getQuote(
-        fromTokenData.mint,
-        toTokenData.mint,
-        amountInSmallestUnit
-      );
+      let quote;
 
-      setSwapData({ 
-        quote, 
-        loading: false, 
-        error: null 
+      if (useRaydium) {
+        // Use Raydium SDK with fallback
+        try {
+          const raydiumSwap = new RaydiumSwap(connection, publicKey, sendTransaction);
+          quote = await raydiumSwap.getQuote(
+            fromTokenData.mint,
+            toTokenData.mint,
+            amountInSmallestUnit
+          );
+
+          if (quote.isRaydium) {
+            toast.success("Raydium quote received!");
+          } else {
+            toast.success("Manual quote (Raydium fallback)");
+          }
+        } catch (error) {
+          console.error("Raydium failed:", error);
+          // Fallback to manual
+          const workingSwap = new WorkingSwap(connection, publicKey, sendTransaction);
+          quote = await workingSwap.getQuote(
+            fromTokenData.mint,
+            toTokenData.mint,
+            amountInSmallestUnit
+          );
+          toast.success("Manual quote (Raydium unavailable)");
+        }
+      } else {
+        // Use manual swap
+        const workingSwap = new WorkingSwap(connection, publicKey, sendTransaction);
+        quote = await workingSwap.getQuote(
+          fromTokenData.mint,
+          toTokenData.mint,
+          amountInSmallestUnit
+        );
+        toast.success("Manual quote received!");
+      }
+
+      setSwapData({
+        quote,
+        loading: false,
+        error: null
       });
-      
-      toast.success("Quote received!");
+
     } catch (err) {
-      setSwapData({ 
-        quote: null, 
-        loading: false, 
-        error: err.message 
+      setSwapData({
+        quote: null,
+        loading: false,
+        error: err.message
       });
       toast.error(`Quote failed: ${err.message}`);
     }
-  }, [formData, connection, publicKey, sendTransaction, tokens]);
+  }, [formData, connection, publicKey, sendTransaction, tokens, useRaydium]);
 
-  // 🔁 Execute REAL swap
+  // Execute swap 
   const handleSwap = async () => {
     if (!swapData.quote || !publicKey) {
       toast.error("No quote or wallet not connected");
@@ -131,93 +170,100 @@ const SwapForm = () => {
     }
 
     setIsSwapping(true);
-    
-    try {
-      const workingSwap = new WorkingSwap(connection, publicKey, sendTransaction);
-      
-      const result = await workingSwap.executeSwap(
-        swapData.quote,
-        fromTokenData.mint,
-        toTokenData.mint
-      );
 
-      // Store transaction details for UI display
+    const currentBalances = { ...balances };
+
+    try {
+      let result;
+
+      if (useRaydium && swapData.quote.poolKeys) {
+        // Execute Raydium swap
+        const raydiumSwap = new RaydiumSwap(connection, publicKey, sendTransaction);
+        result = await raydiumSwap.executeSwap(
+          swapData.quote,
+          fromTokenData.mint,
+          toTokenData.mint
+        );
+      } else {
+        // Execute manual swap
+        const workingSwap = new WorkingSwap(connection, publicKey, sendTransaction);
+        result = await workingSwap.executeSwap(
+          swapData.quote,
+          fromTokenData.mint,
+          toTokenData.mint
+        );
+      }
+
+      // Calculate actual token amounts
+      const inputAmountInTokens = result.inputAmount / Math.pow(10, fromTokenData.decimals);
+      const outputAmountInTokens = result.outputAmount / Math.pow(10, toTokenData.decimals);
+
+      let newBalances = { ...currentBalances };
+
+      if (fromTokenData.symbol === "SOL" && toTokenData.symbol === "USDC") {
+        // SOL → USDC
+        newBalances.sol = Math.max(0, currentBalances.sol - inputAmountInTokens);
+        newBalances.usdc = currentBalances.usdc + outputAmountInTokens;
+      } else if (fromTokenData.symbol === "USDC" && toTokenData.symbol === "SOL") {
+        // USDC → SOL
+        newBalances.sol = currentBalances.sol + outputAmountInTokens;
+        newBalances.usdc = Math.max(0, currentBalances.usdc - inputAmountInTokens);
+      }
+      const sig = result.signature || result.txid;
+
       const transactionDetails = {
-        signature: result.signature,
-        isRealTransaction: result.isRealTransaction,
-        inputAmount: result.inputAmount / Math.pow(10, fromTokenData.decimals),
-        outputAmount: result.outputAmount / Math.pow(10, toTokenData.decimals),
-        fromToken: fromTokenData.symbol,
-        toToken: toTokenData.symbol,
-        timestamp: new Date().toLocaleTimeString(),
-        explorerUrl: `https://explorer.solana.com/tx/${result.signature}?cluster=devnet`
+        walletAddress: publicKey.toBase58(),
+        signature: sig,
+        type: "swap",
+        tokenChanges: [
+          { amount: inputAmountInTokens, tokenSymbol: fromTokenData.symbol },   // token sent
+          { amount: outputAmountInTokens, tokenSymbol: toTokenData.symbol }     // token received
+        ],
+        status: "confirmed",
+        timestamp: Math.floor(Date.now() / 1000),
+        explorerUrl: `https://explorer.solana.com/tx/${sig}?cluster=devnet`,
       };
 
+      // optional
+      transactionDetails.isRealTransaction = result.isRealTransaction;
+      transactionDetails.inputMint = fromTokenData.mint;
+      transactionDetails.outputMint = toTokenData.mint;
+      transactionDetails.fee = result.fee;
+      transactionDetails.priceImpact = result.priceImpact;
+
+      await createTransactionRecord(transactionDetails);
+
       setLastTransaction(transactionDetails);
+
+      // UPDATE UI BALANCES IMMEDIATELY
+      setBalances(newBalances);
+
+      // Notify parent component
+      if (onTransactionComplete) {
+        onTransactionComplete(transactionDetails);
+      }
 
       if (result.isRealTransaction) {
         toast.success(
           <div>
-            <div>✅ REAL Swap Successful!</div>
-            <div className="text-xs">
-              View transaction details below
-            </div>
+            <div>REAL Swap Successful!</div>
+            <div className="text-xs">Using {useRaydium ? "Raydium" : "Manual"} Swap</div>
           </div>
         );
 
-        // Update UI balances based on the swap
-        if (result.isSolToUsdc) {
-          // SOL to USDC swap
-          setBalances(prev => ({
-            sol: Math.max(0, prev.sol - transactionDetails.inputAmount),
-            usdc: prev.usdc + transactionDetails.outputAmount
-          }));
-        } else {
-          // USDC to SOL swap
-          setBalances(prev => ({
-            sol: prev.sol + transactionDetails.outputAmount,
-            usdc: Math.max(0, prev.usdc - transactionDetails.inputAmount)
-          }));
-        }
-
-        // Also refresh actual blockchain balances
-        setTimeout(async () => {
-          try {
-            await refreshBalances();
-          } catch (err) {
-            console.error("Failed to refresh balances:", err);
-          }
-        }, 2000);
-
+        setTimeout(() => refreshBalances(), 2000);
       } else {
         toast.success(
           <div>
-            <div>🔄 Swap Simulation Successful!</div>
-            <div className="text-xs">
-              View simulation details below
-            </div>
+            <div>Simulation Successful!</div>
+            <div className="text-xs">Balances updated locally</div>
           </div>
         );
-
-        // Update UI balances for simulation
-        if (result.isSolToUsdc) {
-          // SOL to USDC swap
-          setBalances(prev => ({
-            sol: Math.max(0, prev.sol - transactionDetails.inputAmount),
-            usdc: prev.usdc + transactionDetails.outputAmount
-          }));
-        } else {
-          // USDC to SOL swap
-          setBalances(prev => ({
-            sol: prev.sol + transactionDetails.outputAmount,
-            usdc: Math.max(0, prev.usdc - transactionDetails.inputAmount)
-          }));
-        }
       }
-      
+      // Reset form
       setFormData({ ...formData, amount: "" });
       setSwapData({ quote: null, loading: false, error: null });
-      
+
     } catch (err) {
       console.error("Swap error:", err);
       toast.error(`❌ Swap failed: ${err.message}`);
@@ -235,20 +281,18 @@ const SwapForm = () => {
     setSwapData({ quote: null, loading: false, error: null });
   };
 
-  // Set max amount (leave some for fees)
   const setMaxAmount = () => {
     const maxAmount = Math.max(0, fromTokenData.balance - 0.001);
     setFormData({ ...formData, amount: maxAmount.toFixed(6) });
   };
 
-  // Manual refresh balances button
   const handleRefreshBalances = async () => {
     toast.loading("Refreshing balances...");
     await refreshBalances();
+    toast.dismiss();
     toast.success("Balances updated!");
   };
 
-  // Clear last transaction
   const clearLastTransaction = () => {
     setLastTransaction(null);
   };
@@ -263,8 +307,7 @@ const SwapForm = () => {
   const fromTokenData = tokens[formData.fromToken];
   const toTokenData = tokens[formData.toToken];
   const inputAmount = parseFloat(formData.amount) || 0;
-  
-  // Calculate output amount
+
   const outputAmount = swapData.quote && swapData.quote.outputAmount
     ? parseFloat(swapData.quote.outputAmount.toString()) / Math.pow(10, toTokenData.decimals)
     : 0;
@@ -274,6 +317,38 @@ const SwapForm = () => {
       <h3 className="text-2xl font-semibold text-white mb-6 text-center">
         Swap Tokens
       </h3>
+
+      {/* Swap Mode Toggle */}
+      <div className="mb-4 p-3 bg-gray-800 rounded-lg">
+        <div className="flex items-center justify-between">
+          <span className="text-sm text-gray-400">Swap Mode:</span>
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => setUseRaydium(false)}
+              className={`px-3 py-1 rounded-lg text-sm transition-colors ${!useRaydium
+                ? "bg-blue-600 text-white"
+                : "bg-gray-700 text-gray-400 hover:bg-gray-600"
+                }`}
+            >
+              Manual (Testing)
+            </button>
+            <button
+              onClick={() => setUseRaydium(true)}
+              className={`px-3 py-1 rounded-lg text-sm transition-colors ${useRaydium
+                ? "bg-purple-600 text-white"
+                : "bg-gray-700 text-gray-400 hover:bg-gray-600"
+                }`}
+            >
+              Raydium (Real)
+            </button>
+          </div>
+        </div>
+        <p className="text-xs text-gray-500 mt-2">
+          {useRaydium
+            ? "Uses real Raydium liquidity pools (may fail on devnet)"
+            : "Manual swap for testing purposes"}
+        </p>
+      </div>
 
       {/* Balance Refresh Button */}
       <div className="mb-4 flex justify-between items-center">
@@ -290,38 +365,51 @@ const SwapForm = () => {
 
       {/* Last Transaction Details */}
       {lastTransaction && (
-        <div className={`mb-4 p-4 rounded-lg border ${
-          lastTransaction.isRealTransaction 
-            ? 'bg-green-900 border-green-700' 
-            : 'bg-yellow-900 border-yellow-700'
-        }`}>
+        <div className={`mb-4 p-4 rounded-lg border ${lastTransaction.isRealTransaction
+          ? 'bg-green-900 border-green-700'
+          : 'bg-yellow-900 border-yellow-700'
+          }`}>
           <div className="flex justify-between items-start mb-2">
             <div>
-              <p className={`font-semibold ${
-                lastTransaction.isRealTransaction ? 'text-green-200' : 'text-yellow-200'
-              }`}>
-                {lastTransaction.isRealTransaction ? '✅ Transaction Successful' : '🔄 Simulation Complete'}
+              <p className={`font-semibold ${lastTransaction.isRealTransaction ? 'text-green-200' : 'text-yellow-200'
+                }`}>
+                {lastTransaction.isRealTransaction ? 'Transaction Successful' : 'Simulation Complete'}
               </p>
               <p className="text-xs text-gray-300 mt-1">
-                {lastTransaction.timestamp}
+                {lastTransaction.timestamp
+                  ? new Date(lastTransaction.timestamp * 1000).toLocaleString()
+                  : ""}
               </p>
             </div>
-            <button 
+            <button
               onClick={clearLastTransaction}
               className="text-gray-400 hover:text-white text-sm"
             >
               ✕
             </button>
           </div>
-          
+
           <div className="space-y-2 text-sm">
             <div className="flex justify-between">
               <span className="text-gray-400">Swapped:</span>
               <span className="text-white">
-                {lastTransaction.inputAmount} {lastTransaction.fromToken} → {lastTransaction.outputAmount} {lastTransaction.toToken}
+                {(lastTransaction?.inputAmount ?? 0).toFixed(4)} {lastTransaction?.fromToken ?? ""}
+                →
+                {(lastTransaction?.outputAmount ?? 0).toFixed(4)} {lastTransaction?.toToken ?? ""}
+
               </span>
             </div>
-            
+
+            <div className="flex justify-between">
+              <span className="text-gray-400">Price Impact:</span>
+              <span className="text-white">{lastTransaction.priceImpact}</span>
+            </div>
+
+            <div className="flex justify-between">
+              <span className="text-gray-400">Fee:</span>
+              <span className="text-white">{(lastTransaction?.fee ?? 0).toFixed(6)} SOL</span>
+            </div>
+
             <div className="flex justify-between items-center">
               <span className="text-gray-400">Signature:</span>
               <div className="flex items-center space-x-2">
@@ -329,7 +417,7 @@ const SwapForm = () => {
                   {lastTransaction.signature.slice(0, 8)}...{lastTransaction.signature.slice(-8)}
                 </code>
                 {lastTransaction.isRealTransaction && (
-                  <a 
+                  <a
                     href={lastTransaction.explorerUrl}
                     target="_blank"
                     rel="noopener noreferrer"
@@ -362,8 +450,8 @@ const SwapForm = () => {
         <div className="flex justify-between text-gray-400 text-sm mb-2">
           <span>From</span>
           <div className="flex items-center space-x-2">
-            <span>Balance: {fromTokenData.balance.toFixed(4)}</span>
-            <button 
+            <span>Balance: {(fromTokenData?.balance ?? 0).toFixed(4)}</span>
+            <button
               onClick={setMaxAmount}
               className="text-blue-400 hover:text-blue-300 text-xs bg-blue-900 px-2 py-1 rounded"
             >
@@ -400,7 +488,7 @@ const SwapForm = () => {
       <div className="bg-gray-800 rounded-lg p-4 mb-4">
         <div className="flex justify-between text-gray-400 text-sm mb-2">
           <span>To</span>
-          <span>Balance: {toTokenData.balance.toFixed(4)}</span>
+          <span>Balance: {(toTokenData?.balance ?? 0).toFixed(4)}</span>
         </div>
         <div className="flex items-center space-x-3">
           <div className="flex items-center bg-gray-700 rounded-lg px-3 py-2 space-x-2">
@@ -414,6 +502,9 @@ const SwapForm = () => {
         {swapData.quote && (
           <div className="mt-2 text-xs text-gray-400">
             Rate: 1 {fromTokenData.symbol} = {swapData.quote.exchangeRate} {toTokenData.symbol}
+            {swapData.quote.priceImpact && (
+              <span className="ml-2">| Impact: {swapData.quote.priceImpact}</span>
+            )}
           </div>
         )}
       </div>
@@ -456,7 +547,7 @@ const SwapForm = () => {
           <div className="text-sm text-gray-400">
             <div className="flex justify-between">
               <span>You pay:</span>
-              <span>{inputAmount} {fromTokenData.symbol}</span>
+              <span>{inputAmount.toFixed(6)} {fromTokenData.symbol}</span>
             </div>
             <div className="flex justify-between">
               <span>You receive:</span>
@@ -466,6 +557,12 @@ const SwapForm = () => {
               <span>Exchange Rate:</span>
               <span>1 {fromTokenData.symbol} = {swapData.quote.exchangeRate} {toTokenData.symbol}</span>
             </div>
+            {swapData.quote.priceImpact && (
+              <div className="flex justify-between">
+                <span>Price Impact:</span>
+                <span>{swapData.quote.priceImpact}</span>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -480,6 +577,7 @@ const SwapForm = () => {
         >
           Solana Devnet
         </a>
+        {useRaydium && " & Raydium"}
       </p>
     </div>
   );

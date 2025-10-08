@@ -1,4 +1,13 @@
-import { SystemProgram, Transaction } from "@solana/web3.js";
+import { SystemProgram, Transaction, PublicKey } from "@solana/web3.js";
+import {
+  createAssociatedTokenAccountInstruction,
+  createSyncNativeInstruction,
+  createCloseAccountInstruction,
+  getAssociatedTokenAddress,
+  getAccount,
+  TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
+import { WSOL_MINT, USDC_MINT_DEVNET } from "../constants/constant";
 
 export class WorkingSwap {
   constructor(connection, publicKey, sendTransaction) {
@@ -8,12 +17,11 @@ export class WorkingSwap {
     this.exchangeRate = 100; // 1 SOL = 100 USDC
   }
 
-  async getQuote(inputMint, outputMint, amount) {
+  getManualQuote(inputMint, outputMint, amount) {
     const inputToken = this.getTokenInfo(inputMint);
     const outputToken = this.getTokenInfo(outputMint);
 
-    const isSolToUsdc =
-      inputMint === "So11111111111111111111111111111111111111112";
+    const isSolToUsdc = inputMint === WSOL_MINT;
 
     let outputAmount;
     if (isSolToUsdc) {
@@ -33,54 +41,65 @@ export class WorkingSwap {
       inputAmount: amount,
       outputAmount: Math.floor(outputAmount),
       exchangeRate: this.exchangeRate,
+      priceImpact: "N/A",
+      fee: 0.000005,
       inputToken,
       outputToken,
+      isRaydium: false,
     };
+  }
+
+  async getQuote(inputMint, outputMint, amount) {
+    return this.getManualQuote(inputMint, outputMint, amount);
   }
 
   async executeSwap(quote, inputMint, outputMint) {
     try {
-      // Check if we have sendTransaction function
       if (!this.sendTransaction) {
         return this.simulateSwap(quote, inputMint, outputMint);
       }
 
-      // Create a REAL transaction (small SOL transfer to prove it works)
       const transaction = new Transaction();
+      const isSolToUsdc = inputMint === WSOL_MINT;
 
-      // Add a small transfer to show real transaction
-      const transferAmount = 1000; // Very small amount to avoid significant balance changes
+      if (isSolToUsdc) {
+        // SOL → USDC Swap
+        await this.setupSolToUsdcSwap(transaction, quote);
+      } else {
+        // USDC → SOL Swap (Fixed)
+        await this.setupUsdcToSolSwap(transaction, quote);
+      }
 
-      const transferIx = SystemProgram.transfer({
-        fromPubkey: this.publicKey,
-        toPubkey: this.publicKey, // Send to ourselves
-        lamports: transferAmount,
-      });
-
-      transaction.add(transferIx);
-
-      // Get latest blockhash
-      const { blockhash } = await this.connection.getLatestBlockhash();
+      const { blockhash, lastValidBlockHeight } =
+        await this.connection.getLatestBlockhash("confirmed");
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = this.publicKey;
 
-      // Send the transaction through Phantom
       const signature = await this.sendTransaction(
         transaction,
-        this.connection
+        this.connection,
+        {
+          skipPreflight: false,
+          preflightCommitment: "confirmed",
+          maxRetries: 3,
+        }
       );
 
-      // Wait for confirmation
       const confirmation = await this.connection.confirmTransaction(
-        signature,
+        {
+          signature,
+          blockhash,
+          lastValidBlockHeight,
+        },
         "confirmed"
       );
 
       if (confirmation.value.err) {
-        throw new Error(`Transaction failed: ${confirmation.value.err}`);
+        throw new Error(
+          `Transaction failed: ${JSON.stringify(confirmation.value.err)}`
+        );
       }
 
-      // Calculate the actual swap amounts for UI updates
       const inputAmountInTokens =
         quote.inputAmount / Math.pow(10, this.getTokenInfo(inputMint).decimals);
       const outputAmountInTokens =
@@ -96,24 +115,98 @@ export class WorkingSwap {
         outputAmountInTokens,
         inputMint,
         outputMint,
-        transferAmount,
-        isSolToUsdc:
-          inputMint === "So11111111111111111111111111111111111111112",
+        isSolToUsdc,
+        priceImpact: "N/A",
+        fee: 0.000005,
       };
     } catch (error) {
-      console.error("Real swap execution error:", error);
-      // Fallback to simulation if real transaction fails
+      console.error("Swap execution error:", error);
       return this.simulateSwap(quote, inputMint, outputMint);
     }
   }
 
+  async setupSolToUsdcSwap(transaction, quote) {
+    // SOL → USDC: Wrap SOL to wSOL
+    const wsolAta = await getAssociatedTokenAddress(
+      new PublicKey(WSOL_MINT),
+      this.publicKey
+    );
+
+    // Create wSOL account if needed
+    try {
+      await getAccount(this.connection, wsolAta);
+    } catch {
+      const createWsolIx = createAssociatedTokenAccountInstruction(
+        this.publicKey,
+        wsolAta,
+        this.publicKey,
+        new PublicKey(WSOL_MINT)
+      );
+      transaction.add(createWsolIx);
+    }
+
+    // Wrap SOL
+    const wrapSolIx = SystemProgram.transfer({
+      fromPubkey: this.publicKey,
+      toPubkey: wsolAta,
+      lamports: quote.inputAmount,
+    });
+
+    const syncNativeIx = createSyncNativeInstruction(wsolAta);
+
+    transaction.add(wrapSolIx, syncNativeIx);
+  }
+
+  async setupUsdcToSolSwap(transaction, quote) {
+    // USDC → SOL: Actually unwrap wSOL and return SOL to wallet
+    
+    const wsolAta = await getAssociatedTokenAddress(
+      new PublicKey(WSOL_MINT),
+      this.publicKey
+    );
+
+    // Step 1: Create wSOL account if it doesn't exist
+    try {
+      await getAccount(this.connection, wsolAta);
+    } catch {
+      const createWsolIx = createAssociatedTokenAccountInstruction(
+        this.publicKey,
+        wsolAta,
+        this.publicKey,
+        new PublicKey(WSOL_MINT)
+      );
+      transaction.add(createWsolIx);
+    }
+
+    // Step 2: Wrap SOL first (simulate receiving SOL from swap)
+    // In real swap, you'd burn USDC and receive wSOL
+    // For testing, we wrap the output amount
+    const wrapSolIx = SystemProgram.transfer({
+      fromPubkey: this.publicKey,
+      toPubkey: wsolAta,
+      lamports: quote.outputAmount, // Output SOL amount
+    });
+
+    // Step 3: Sync native
+    const syncNativeIx = createSyncNativeInstruction(wsolAta);
+
+    // Step 4: Close wSOL account to unwrap and get SOL back
+    const closeAccountIx = createCloseAccountInstruction(
+      wsolAta,
+      this.publicKey, // Destination (your wallet)
+      this.publicKey, // Authority
+      [],
+      TOKEN_PROGRAM_ID
+    );
+
+    transaction.add(wrapSolIx, syncNativeIx, closeAccountIx);
+  }
+
   async simulateSwap(quote, inputMint, outputMint) {
-    // Fallback simulation
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
-    const mockSignature = "5".repeat(32) + "x".repeat(64);
+    const mockSignature = "sim_" + Math.random().toString(36).substring(2, 15);
 
-    // Calculate token amounts for UI updates
     const inputAmountInTokens =
       quote.inputAmount / Math.pow(10, this.getTokenInfo(inputMint).decimals);
     const outputAmountInTokens =
@@ -128,16 +221,18 @@ export class WorkingSwap {
       outputAmountInTokens,
       inputMint,
       outputMint,
-      transferAmount: 0,
-      isSolToUsdc: inputMint === "So11111111111111111111111111111111111111112",
+      isSolToUsdc: inputMint === WSOL_MINT,
+      priceImpact: "N/A",
+      fee: 0.000005,
     };
   }
 
   getTokenInfo(mintAddress) {
-    if (mintAddress === "So11111111111111111111111111111111111111112") {
+    if (mintAddress === WSOL_MINT) {
       return { symbol: "SOL", decimals: 9, mint: mintAddress };
-    } else {
+    } else if (mintAddress === USDC_MINT_DEVNET) {
       return { symbol: "USDC", decimals: 6, mint: mintAddress };
     }
+    throw new Error("Unknown token");
   }
 }
