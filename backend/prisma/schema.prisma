@@ -18,6 +18,10 @@ model Transaction {
   explorerUrl   String?
 
   // Optional fields
+  from          String?
+  to            String?
+  value         Float?
+
   isRealTransaction Boolean?  // optional
   inputMint         String?   // optional
   outputMint        String?   // optional
